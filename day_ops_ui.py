@@ -8,7 +8,14 @@ from tkinter import filedialog, messagebox
 # Certifique-se de que esses arquivos existam no seu diretório
 from gcal_sync import sync_ops_plan
 
-from day_ops_core import DailyOpsRunner, DailyOpsConfig, TaskStore, TaskItem
+from day_ops_core import (
+    DailyOpsRunner,
+    DailyOpsConfig,
+    TaskStore,
+    TaskItem,
+    DistractionStore,
+    check_identity_overload,
+)
 
 
 # =========================================================
@@ -45,6 +52,7 @@ class DailyOpsUI:
         self.state = UIState(vault_dir=Path.home() / ".ops_agent")
         self.store = TaskStore(self.state.vault_dir)
         self.tasks = self.store.load_today()
+        self.distraction_store = DistractionStore(self.state.vault_dir)
 
         self.runner = DailyOpsRunner(DailyOpsConfig(model="gpt-5-mini"))
 
@@ -129,6 +137,7 @@ class DailyOpsUI:
         self._btn(btns, "Edit", self._edit_task).pack(side="left", padx=6)
         self._btn(btns, "Done", self._mark_done).pack(side="left", padx=6)
         self._btn(btns, "Delete", self._delete_task).pack(side="left", padx=6)
+        self._btn(btns, "Dominó!", self._capture_distraction).pack(side="left", padx=6)
 
         # Right panel: chat
         right = tk.Frame(main, bg=THEME["panel"], bd=1, highlightthickness=1, highlightbackground=THEME["neon"])
@@ -162,6 +171,7 @@ class DailyOpsUI:
         )
         self._btn(quick, "Reduzir escopo", lambda: self._send("Estou sobrecarregado. Reduza para o mínimo viável."))\
             .pack(side="left", padx=6)
+        self._btn(quick, "Desligamento", self._shut_down_ritual).pack(side="left", padx=6)
 
         bottom = tk.Frame(right, bg=THEME["panel"])
         bottom.pack(fill="x", padx=10, pady=(0, 10))
@@ -243,6 +253,10 @@ class DailyOpsUI:
             icon = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
             self.task_list.insert("end", f"{icon} [{t.priority}] {t.title}")
 
+        warning = check_identity_overload(self.tasks)
+        if warning:
+            self._log("SYSTEM", warning)
+
     def _selected_task_index(self) -> int:
         sel = self.task_list.curselection()
         return int(sel[0]) if sel else -1
@@ -272,6 +286,99 @@ class DailyOpsUI:
         self.tasks[idx].status = "DONE"
         self.store.save_today(self.tasks)
         self._refresh_task_list()
+
+    # --- Dominó Mental: captura de distrações ---
+    def _capture_distraction(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Dominó Mental // Capturar Distração")
+        win.configure(bg=THEME["panel"])
+        win.geometry("420x170")
+
+        tk.Label(
+            win,
+            text="O que quer tirar da cabeça agora?",
+            fg=THEME["neon"],
+            bg=THEME["panel"],
+            font=THEME["font_big"],
+        ).pack(pady=(14, 6))
+
+        entry = tk.Entry(
+            win,
+            bg=THEME["bg"],
+            fg=THEME["text"],
+            insertbackground=THEME["neon"],
+            font=THEME["font"],
+        )
+        entry.pack(fill="x", padx=20)
+        entry.focus_set()
+
+        def save() -> None:
+            txt = entry.get().strip()
+            if txt:
+                self.distraction_store.add(txt)
+                self._log("SYSTEM", f"Distração anotada: '{txt}'. Volte ao foco!")
+            win.destroy()
+
+        tk.Button(
+            win,
+            text="ANOTAR E VOLTAR",
+            command=save,
+            bg=THEME["pink"],
+            fg=THEME["bg"],
+            relief="flat",
+            font=THEME["font_big"],
+        ).pack(pady=16)
+
+    # --- Ritual de Desligamento: processar distrações do dia ---
+    def _shut_down_ritual(self) -> None:
+        items = self.distraction_store.load()
+        if not items:
+            self._log(
+                "OPS",
+                "Ritual de Desligamento iniciado. Nenhuma distração capturada. O dia está limpo! Desligamento concluído.",
+            )
+            return
+
+        self._log(
+            "OPS",
+            f"Ritual de Desligamento: você capturou {len(items)} distrações hoje. Vamos processá-las agora.",
+        )
+
+        win = tk.Toplevel(self.root)
+        win.title("Ritual de Desligamento")
+        win.configure(bg=THEME["panel"])
+        win.geometry("520x420")
+
+        txt_area = tk.Text(
+            win,
+            bg=THEME["panel2"],
+            fg=THEME["text"],
+            font=THEME["font"],
+            wrap="word",
+            relief="flat",
+        )
+        txt_area.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for item in items:
+            txt_area.insert("end", f"• {item}\n")
+
+        def finish() -> None:
+            self.distraction_store.clear()
+            self._log(
+                "SYSTEM",
+                "Lista de distrações limpa. Agora, foco total na recarga. Desligamento concluído.",
+            )
+            win.destroy()
+
+        tk.Button(
+            win,
+            text="LIMPAR TUDO E ENCERRAR DIA",
+            command=finish,
+            bg=THEME["neon"],
+            fg=THEME["bg"],
+            relief="flat",
+            font=THEME["font_big"],
+        ).pack(pady=10)
 
     def _task_editor(self, title: str, task: TaskItem | None = None, index: int | None = None) -> None:
         win = tk.Toplevel(self.root)

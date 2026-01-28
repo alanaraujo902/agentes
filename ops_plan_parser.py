@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from typing import List
 
 PLAN_BLOCK = re.compile(r"2\)\s*Plano(.*?)3\)", re.S)
-LINE = re.compile(
-    r"-\s*(\d{2}:\d{2})[–-](\d{2}:\d{2})\s*—\s*(.+)"
-)
+# Suporta categoria opcional no formato [CATEGORIA]
+LINE = re.compile(r"-\s*(\d{2}:\d{2})[–-](\d{2}:\d{2})\s*—\s*(\[.*?\])?\s*(.+)")
 PRIO = re.compile(r"\((?:\d+ min;\s*)?(P\d)\)")
+
 
 @dataclass
 class PlanTask:
@@ -24,8 +24,7 @@ def parse_ops_plan(text: str) -> List[PlanTask]:
         return []
 
     block = m.group(1)
-
-    tasks = []
+    tasks: List[PlanTask] = []
 
     for line in block.splitlines():
         line = line.strip()
@@ -36,21 +35,24 @@ def parse_ops_plan(text: str) -> List[PlanTask]:
         if not lm:
             continue
 
-        start, end, rest = lm.groups()
+        start, end, category, rest = lm.groups()
+        category = category or ""
 
+        # Captura prioridade
         prio = "P2"
         pm = PRIO.search(rest)
         if pm:
             prio = pm.group(1)
 
-        # remove (...) finais
-        title = re.sub(r"\(.*?\)", "", rest).strip()
+        # Limpa o título (remove parênteses de prioridade/tempo)
+        title_clean = re.sub(r"\(.*?\)", "", rest).strip()
+        full_title = f"{category} {title_clean}".strip()
 
         tasks.append(
             PlanTask(
                 start=start,
                 end=end,
-                title=title,
+                title=full_title,
                 priority=prio,
             )
         )
