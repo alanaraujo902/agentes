@@ -1,13 +1,13 @@
-# ops_plan_parser.py
-
 import re
 from dataclasses import dataclass
 from typing import List
 
-PLAN_BLOCK = re.compile(r"2\)\s*Plano(.*?)3\)", re.S)
-# Suporta categoria opcional no formato [CATEGORIA]
-LINE = re.compile(r"-\s*(\d{2}:\d{2})[–-](\d{2}:\d{2})\s*—\s*(\[.*?\])?\s*(.+)")
-PRIO = re.compile(r"\((?:\d+ min;\s*)?(P\d)\)")
+# MELHORIA: Só encerra o plano se encontrar o "3)" isolado no início de uma linha
+PLAN_BLOCK = re.compile(r"2\)\s*Plano(.*?)(?=\n\s*3\)|$)", re.S | re.I)
+
+# MELHORIA: Regex ultra-flexível para capturar a linha independente do tipo de traço
+# Captura: 1.Início, 2.Fim, 3.Categoria(opcional), 4.Resto
+LINE = re.compile(r"-\s*(\d{2}:\d{2})\s*[\-–—]\s*(\d{2}:\d{2})\s*[\-–—]?\s*(\[.*?\])?\s*(.*)")
 
 
 @dataclass
@@ -36,25 +36,22 @@ def parse_ops_plan(text: str) -> List[PlanTask]:
             continue
 
         start, end, category, rest = lm.groups()
-        category = category or ""
 
-        # Captura prioridade
+        # Extrair Prioridade (P1, P2 ou P3) de dentro dos parênteses
         prio = "P2"
-        pm = PRIO.search(rest)
-        if pm:
-            prio = pm.group(1)
+        prio_match = re.search(r"\(.*?(P\d).*?\)", rest)
+        if prio_match:
+            prio = prio_match.group(1)
 
-        # Limpa o título (remove parênteses de prioridade/tempo)
-        title_clean = re.sub(r"\(.*?\)", "", rest).strip()
-        full_title = f"{category} {title_clean}".strip()
+        # Limpar o título: remove os parênteses do final (ex: tempo e prioridade)
+        title_clean = re.sub(r"\(.*?\)\s*$", "", rest).strip()
 
-        tasks.append(
-            PlanTask(
-                start=start,
-                end=end,
-                title=full_title,
-                priority=prio,
-            )
-        )
+        # Remove traços soltos que sobram no título
+        title_clean = title_clean.lstrip("—–- ").strip()
+
+        # Deixa apenas o nome da tarefa, sem categoria
+        full_title = title_clean
+
+        tasks.append(PlanTask(start=start, end=end, title=full_title, priority=prio))
 
     return tasks

@@ -28,17 +28,19 @@ class TaskItem:
     id: str
     title: str
     notes: str = ""
-    priority: str = "P2"       # P1 / P2 / P3
+    quadrant: str = "Q2"       # Q1, Q2, Q3, Q4
+    period: str = "MANHÃ"      # MANHÃ / TARDE / NOITE
     status: str = "TODO"       # TODO / DOING / DONE
     created_at: float = 0.0
 
     @staticmethod
-    def create(title: str, notes: str = "", priority: str = "P2") -> "TaskItem":
+    def create(title: str, notes: str = "", quadrant: str = "Q2", period: str = "MANHÃ") -> "TaskItem":
         return TaskItem(
             id=str(uuid.uuid4())[:8],
             title=title.strip(),
             notes=notes.strip(),
-            priority=priority.strip().upper(),
+            quadrant=quadrant.strip().upper(),
+            period=period.strip().upper(),
             status="TODO",
             created_at=time.time(),
         )
@@ -63,7 +65,29 @@ class TaskStore:
         data = json.loads(fp.read_text(encoding="utf-8"))
         tasks: List[TaskItem] = []
         for item in data.get("tasks", []):
-            tasks.append(TaskItem(**item))
+            # Backward-compat: converte tarefas antigas com 'priority' para 'quadrant'
+            quadrant = item.get("quadrant")
+            if quadrant is None:
+                prio = item.get("priority", "P2")
+                quadrant = {
+                    "P1": "Q1",  # Importante e urgente
+                    "P2": "Q2",  # Importante, não urgente
+                    "P3": "Q3",  # Não importante, urgente
+                }.get(prio, "Q4")
+
+            period = item.get("period", "MANHÃ")
+
+            tasks.append(
+                TaskItem(
+                    id=item.get("id", str(uuid.uuid4())[:8]),
+                    title=item.get("title", "").strip(),
+                    notes=item.get("notes", "").strip(),
+                    quadrant=str(quadrant).upper(),
+                    period=str(period).upper(),
+                    status=item.get("status", "TODO"),
+                    created_at=item.get("created_at", time.time()),
+                )
+            )
         return tasks
 
     def save_today(self, tasks: List[TaskItem]) -> None:
@@ -94,6 +118,32 @@ class DistractionStore:
     def clear(self) -> None:
         if self.fp.exists():
             self.fp.unlink()
+
+
+class ChatStore:
+    """Persistência do histórico de chat por dia."""
+
+    def __init__(self, vault_dir: Path) -> None:
+        self.vault_dir = vault_dir
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_file(self) -> Path:
+        yyyy_mm_dd = time.strftime("%Y-%m-%d")
+        return self.vault_dir / f"chat_history_{yyyy_mm_dd}.json"
+
+    def load(self) -> List[Dict[str, str]]:
+        fp = self._get_file()
+        if not fp.exists():
+            return []
+        try:
+            return json.loads(fp.read_text(encoding="utf-8")).get("messages", [])
+        except Exception:
+            return []
+
+    def save(self, messages: List[Dict[str, str]]) -> None:
+        fp = self._get_file()
+        payload = {"messages": messages}
+        fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # =========================================================
@@ -147,12 +197,12 @@ Notei muitas tarefas pequenas. Cuidado com o "Dominó Mental": não deixe uma ab
 
 
 def check_identity_overload(tasks: List[TaskItem]) -> str:
-    """Filtro de Identidade e alerta de excesso de P1 (vício em problemas)."""
-    p1_tasks = [t for t in tasks if t.priority == "P1" and t.status != "DONE"]
-    if len(p1_tasks) > 5:
+    """Filtro de Identidade e alerta de excesso de Q1 (incêndios demais)."""
+    q1_tasks = [t for t in tasks if getattr(t, "quadrant", "Q2") == "Q1" and t.status != "DONE"]
+    if len(q1_tasks) > 5:
         return (
-            "\n⚠️ ALERTA NINJA: Você tem mais de 5 tarefas P1. Parece que está tentando abraçar o mundo. "
-            "Escolha a tarefa que, se feita, torna várias outras desnecessárias ou mais fáceis."
+            "\n⚠️ ALERTA NINJA: Você tem mais de 5 tarefas no Quadrante Q1. Parece que está tentando apagar incêndios demais. "
+            "Escolha o incêndio que, se resolvido, reduz ou elimina vários outros."
         )
     return ""
 
@@ -161,29 +211,38 @@ def check_identity_overload(tasks: List[TaskItem]) -> str:
 # Runner stateful (mantém conversa)
 # =========================================================
 class DailyOpsRunner:
-    def __init__(self, config: DailyOpsConfig) -> None:
+    def __init__(self, config: DailyOpsConfig, history: Optional[List[Dict[str, str]]] = None) -> None:
         self.config = config
         self._model_client = OpenAIChatCompletionClient(model=config.model)
         self._agent = AssistantAgent(
             name="ops_agent",
             model_client=self._model_client,
             system_message=OPS_SYSTEM,
-            model_client_stream=True,                 # streaming :contentReference[oaicite:2]{index=2}
+            model_client_stream=True,
             max_tool_iterations=config.max_tool_iterations,
         )
+        # Histórico de mensagens user/assistant (persistido por dia)
+        self.history: List[Dict[str, str]] = history or []
         self._lock = asyncio.Lock()
 
     def _build_context(self, tasks: List[TaskItem]) -> str:
         # Limita número de tasks para não poluir contexto
+        quadrant_order = {"Q1": 0, "Q2": 1, "Q3": 2, "Q4": 3}
         tasks_sorted = sorted(
             tasks,
-            key=lambda t: (t.status != "DOING", t.priority, t.created_at),
+            key=lambda t: (
+                t.status == "DONE",  # TODO/DOING primeiro
+                quadrant_order.get(getattr(t, "quadrant", "Q2"), 9),
+                t.created_at,
+            ),
         )[: self.config.max_context_tasks]
 
-        lines = []
+        lines: List[str] = []
         for t in tasks_sorted:
             prefix = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
-            lines.append(f"{prefix} [{t.priority}] ({t.status}) {t.title}")
+            quadrant = getattr(t, "quadrant", "Q2")
+            period = getattr(t, "period", "MANHÃ")
+            lines.append(f"{prefix} [{quadrant}] ({period}) {t.title}")
 
         if not lines:
             return "Sem tarefas registradas hoje."
@@ -219,6 +278,10 @@ class DailyOpsRunner:
                     continue
                 full += text
                 on_chunk(text)
+
+            # Atualiza histórico interno
+            self.history.append({"role": "user", "content": user_message})
+            self.history.append({"role": "assistant", "content": full})
 
             if on_final is not None:
                 on_final(full)

@@ -20,9 +20,11 @@ from googleapiclient.discovery import build
 # Escopo com permissão de escrita no calendário
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Aceita 06:00–06:20, 06:00-06:20, etc.
-TIME_RANGE_RE = re.compile(r"(?P<start>\d{1,2}:\d{2})\s*[–-]\s*(?P<end>\d{1,2}:\d{2})")
-PREFIX_CLEAN_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*[–-]\s*\d{1,2}:\d{2}\s*[—-]\s*")
+# Aceita qualquer um dos 3 tipos de traços entre as horas
+TIME_RANGE_RE = re.compile(r"(?P<start>\d{1,2}:\d{2})\s*[\-–—]\s*(?P<end>\d{1,2}:\d{2})")
+
+# Remove o prefixo de hora e o traço seguinte do título, aceitando qualquer traço
+PREFIX_CLEAN_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*[\-–—]\s*\d{1,2}:\d{2}\s*[\-–—]\s*")
 
 DEFAULT_TZ = "America/Sao_Paulo"
 
@@ -132,9 +134,10 @@ def sync_tasks_to_gcal(
         notes = getattr(t, "notes", "")
 
         event_body = {
-            "summary": f"[{prio}] {clean_title}",
+            "summary": clean_title,
             "description": (
                 f"OPS_AGENT task_id={getattr(t, 'id', '')}\n"
+                f"Prioridade: {prio}\n"
                 f"status={status}\n\n"
                 f"{notes}".strip()
             ),

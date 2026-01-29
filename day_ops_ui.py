@@ -14,6 +14,7 @@ from day_ops_core import (
     TaskStore,
     TaskItem,
     DistractionStore,
+    ChatStore,
     check_identity_overload,
 )
 
@@ -51,18 +52,25 @@ class DailyOpsUI:
 
         self.state = UIState(vault_dir=Path.home() / ".ops_agent")
         self.store = TaskStore(self.state.vault_dir)
-        self.tasks = self.store.load_today()
         self.distraction_store = DistractionStore(self.state.vault_dir)
 
-        self.runner = DailyOpsRunner(DailyOpsConfig(model="gpt-5-mini"))
+        # --- Novo: persistência de chat ---
+        self.chat_store = ChatStore(self.state.vault_dir)
+        chat_history = self.chat_store.load()
+
+        # Runner recebe histórico para manter "memória" no dia
+        self.runner = DailyOpsRunner(DailyOpsConfig(model="gpt-4o-mini"), history=chat_history)
 
         self.ui_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._build_layout()
-        self._refresh_task_list()
-        self._ui_pump()
 
-        self.last_agent_output = ""
+        # Carrega estado inicial
         self.tasks = self.store.load_today()
+        self._refresh_task_list()
+        self._load_chat_history_to_ui(chat_history)
+
+        self._ui_pump()
+        self.last_agent_output = ""
 
 
     # ---------------- UI Layout ----------------
@@ -129,6 +137,66 @@ class DailyOpsUI:
             highlightthickness=0,
         )
         self.task_list.pack(padx=10, pady=8)
+
+        # --- QUICK ADD SECTION ---
+        quick_add_frame = tk.Frame(left, bg=THEME["panel2"], pady=5)
+        quick_add_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        # Input de texto
+        self.quick_entry = tk.Entry(
+            quick_add_frame,
+            bg=THEME["bg"],
+            fg=THEME["text"],
+            insertbackground=THEME["neon"],
+            font=THEME["font"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=THEME["panel"],
+        )
+        self.quick_entry.pack(side="left", fill="x", expand=True, padx=(5, 2))
+        self.quick_entry.bind("<Return>", lambda e: self._quick_add())
+
+        # Seletor de Quadrante (Q1–Q4)
+        self.quick_quadrant_var = tk.StringVar(value="Q2")
+        quad_opt = tk.OptionMenu(quick_add_frame, self.quick_quadrant_var, "Q1", "Q2", "Q3", "Q4")
+        quad_opt.config(
+            bg=THEME["bg"],
+            fg=THEME["pink"],
+            activebackground=THEME["pink"],
+            relief="flat",
+            font=("Consolas", 8),
+            highlightthickness=0,
+            width=3,
+        )
+        quad_opt["menu"].config(bg=THEME["panel"], fg=THEME["text"])
+        quad_opt.pack(side="left", padx=2)
+
+        # Seletor de Período (MANHÃ/TARDE/NOITE)
+        self.quick_period_var = tk.StringVar(value="MANHÃ")
+        period_opt = tk.OptionMenu(quick_add_frame, self.quick_period_var, "MANHÃ", "TARDE", "NOITE")
+        period_opt.config(
+            bg=THEME["bg"],
+            fg=THEME["neon"],
+            activebackground=THEME["neon"],
+            relief="flat",
+            font=("Consolas", 8),
+            highlightthickness=0,
+            width=6,
+        )
+        period_opt["menu"].config(bg=THEME["panel"], fg=THEME["text"])
+        period_opt.pack(side="left", padx=2)
+
+        # Botão +
+        tk.Button(
+            quick_add_frame,
+            text="+",
+            command=self._quick_add,
+            bg=THEME["pink"],
+            fg=THEME["bg"],
+            relief="flat",
+            font=THEME["font_big"],
+            padx=10,
+        ).pack(side="right", padx=5)
 
         btns = tk.Frame(left, bg=THEME["panel"])
         btns.pack(fill="x", padx=10, pady=(0, 10))
@@ -203,6 +271,15 @@ class DailyOpsUI:
 
         self._log("SYSTEM", "OPS_AGENT online. Adicione tarefas e mande mensagens.")
 
+    def _load_chat_history_to_ui(self, history) -> None:
+        """Preenche a caixa de texto com as conversas anteriores."""
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            who = "YOU" if role == "user" else "OPS"
+            color = THEME["pink"] if who == "YOU" else THEME["neon"]
+            self._append_chat(who, content, color)
+
     def _btn(self, parent, label, cmd):
         return tk.Button(
             parent,
@@ -249,43 +326,87 @@ class DailyOpsUI:
     # ---------------- Tasks ----------------
     def _refresh_task_list(self) -> None:
         self.task_list.delete(0, "end")
-        for t in self.tasks:
-            icon = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
-            self.task_list.insert("end", f"{icon} [{t.priority}] {t.title}")
+
+        # Mapa de índice visual -> TaskItem real (por causa dos separadores)
+        self.list_index_map: dict[int, TaskItem] = {}
+
+        def add_section(title: str, color: str, quadrants: list[str]) -> None:
+            header_index = self.task_list.size()
+            self.task_list.insert("end", f"── {title} ──")
+            self.task_list.itemconfig(header_index, foreground=color)
+
+            filtered = [t for t in self.tasks if getattr(t, "quadrant", "Q2") in quadrants]
+            for t in filtered:
+                icon = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
+                idx = self.task_list.size()
+                period_short = (getattr(t, "period", "MANHÃ") or "MANHÃ")[0].upper()
+                self.task_list.insert("end", f"  {icon} [{t.quadrant}] ({period_short}) {t.title}")
+                if t.status == "DONE":
+                    self.task_list.itemconfig(idx, foreground=THEME["muted"])
+                self.list_index_map[idx] = t
+
+        # 1. O POUCO VITAL (Q1, Q2)
+        add_section("O POUCO VITAL (20%)", THEME["neon"], ["Q1", "Q2"])
+
+        # Espaço em branco
+        self.task_list.insert("end", "")
+
+        # 2. AS MUITAS TRIVIALIDADES (Q3, Q4)
+        add_section("AS MUITAS TRIVIALIDADES (80%)", THEME["muted"], ["Q3", "Q4"])
 
         warning = check_identity_overload(self.tasks)
         if warning:
             self._log("SYSTEM", warning)
 
-    def _selected_task_index(self) -> int:
+    def _selected_task_index(self) -> TaskItem | None:
         sel = self.task_list.curselection()
-        return int(sel[0]) if sel else -1
+        if not sel:
+            return None
+        return self.list_index_map.get(int(sel[0]))
 
     def _add_task(self) -> None:
         self._task_editor(title="Nova tarefa")
 
     def _edit_task(self) -> None:
-        idx = self._selected_task_index()
-        if idx < 0:
+        task = self._selected_task_index()
+        if not task:
             messagebox.showinfo("Ops", "Selecione uma tarefa para editar.")
             return
-        self._task_editor(title="Editar tarefa", task=self.tasks[idx], index=idx)
+        idx = self.tasks.index(task)
+        self._task_editor(title="Editar tarefa", task=task, index=idx)
 
     def _delete_task(self) -> None:
-        idx = self._selected_task_index()
-        if idx < 0:
+        task = self._selected_task_index()
+        if not task:
             return
-        self.tasks.pop(idx)
+        self.tasks.remove(task)
         self.store.save_today(self.tasks)
         self._refresh_task_list()
 
     def _mark_done(self) -> None:
-        idx = self._selected_task_index()
-        if idx < 0:
+        task = self._selected_task_index()
+        if not task:
             return
-        self.tasks[idx].status = "DONE"
+        task.status = "DONE"
         self.store.save_today(self.tasks)
         self._refresh_task_list()
+
+    def _quick_add(self) -> None:
+        """Adição rápida de tarefas sem abrir popups."""
+        title = self.quick_entry.get().strip()
+        if not title:
+            return
+
+        quad = self.quick_quadrant_var.get() if hasattr(self, "quick_quadrant_var") else "Q2"
+        period = self.quick_period_var.get() if hasattr(self, "quick_period_var") else "MANHÃ"
+
+        new_task = TaskItem.create(title=title, quadrant=quad, period=period)
+        self.tasks.append(new_task)
+        self.store.save_today(self.tasks)
+        self._refresh_task_list()
+
+        self.quick_entry.delete(0, "end")
+        self.quick_entry.focus_set()
 
     # --- Dominó Mental: captura de distrações ---
     def _capture_distraction(self) -> None:
@@ -384,48 +505,96 @@ class DailyOpsUI:
         win = tk.Toplevel(self.root)
         win.title(title)
         win.configure(bg=THEME["panel"])
-        win.geometry("520x280")
 
-        tk.Label(win, text="Título", fg=THEME["text"], bg=THEME["panel"], font=THEME["font"]).pack(
-            anchor="w", padx=12, pady=(12, 4)
+        # --- LÓGICA DE CENTRALIZAÇÃO ---
+        win.withdraw()  # Esconde a janela enquanto calcula a posição
+        win.update_idletasks()
+
+        # Tamanho da janela de edição
+        w, h = 520, 420
+
+        # Posição e tamanho da janela principal
+        root_x = self.root.winfo_x()
+        root_y = self.root.winfo_y()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+
+        # Calcula o centro
+        pos_x = root_x + (root_w // 2) - (w // 2)
+        pos_y = root_y + (root_h // 2) - (h // 2)
+
+        win.geometry(f"{w}x{h}+{pos_x}+{pos_y}")
+        win.transient(self.root)  # Define como dependente da principal
+        win.grab_set()            # Bloqueia interação com a principal até fechar
+        win.deiconify()           # Mostra a janela centralizada
+
+        # --- CAMPOS DO EDITOR ---
+        def add_field(label: str, default_val: str = "") -> tk.Entry:
+            tk.Label(
+                win,
+                text=label,
+                fg=THEME["text"],
+                bg=THEME["panel"],
+                font=THEME["font"],
+            ).pack(anchor="w", padx=20, pady=(10, 2))
+            entry = tk.Entry(
+                win,
+                bg=THEME["bg"],
+                fg=THEME["text"],
+                insertbackground=THEME["neon"],
+                font=THEME["font"],
+                relief="flat",
+            )
+            entry.pack(fill="x", padx=20)
+            entry.insert(0, default_val)
+            return entry
+
+        e_title = add_field("Título", task.title if task else "")
+        e_notes = add_field("Notas (opcional)", task.notes if task else "")
+
+        # Seletores para Quadrante e Período
+        tk.Label(
+            win,
+            text="Quadrante e Período",
+            fg=THEME["text"],
+            bg=THEME["panel"],
+            font=THEME["font"],
+        ).pack(anchor="w", padx=20, pady=(10, 2))
+
+        row = tk.Frame(win, bg=THEME["panel"])
+        row.pack(fill="x", padx=20)
+
+        q_var = tk.StringVar(value=(task.quadrant if task else "Q2"))
+        tk.OptionMenu(row, q_var, "Q1", "Q2", "Q3", "Q4").pack(
+            side="left", expand=True, fill="x"
         )
-        e_title = tk.Entry(win, bg=THEME["bg"], fg=THEME["text"], insertbackground=THEME["neon"], font=THEME["font"])
-        e_title.pack(fill="x", padx=12)
-        if task:
-            e_title.insert(0, task.title)
 
-        tk.Label(win, text="Notas (opcional)", fg=THEME["text"], bg=THEME["panel"], font=THEME["font"]).pack(
-            anchor="w", padx=12, pady=(10, 4)
+        p_var = tk.StringVar(value=(task.period if task else "MANHÃ"))
+        tk.OptionMenu(row, p_var, "MANHÃ", "TARDE", "NOITE").pack(
+            side="left", expand=True, fill="x", padx=(10, 0)
         )
-        e_notes = tk.Entry(win, bg=THEME["bg"], fg=THEME["text"], insertbackground=THEME["neon"], font=THEME["font"])
-        e_notes.pack(fill="x", padx=12)
-        if task:
-            e_notes.insert(0, task.notes)
 
-        tk.Label(win, text="Prioridade (P1/P2/P3)", fg=THEME["text"], bg=THEME["panel"], font=THEME["font"]).pack(
-            anchor="w", padx=12, pady=(10, 4)
-        )
-        e_prio = tk.Entry(win, bg=THEME["bg"], fg=THEME["text"], insertbackground=THEME["neon"], font=THEME["font"])
-        e_prio.pack(fill="x", padx=12)
-        e_prio.insert(0, (task.priority if task else "P2"))
-
-        def save():
-            title_val = e_title.get().strip()
-            if not title_val:
-                messagebox.showerror("Erro", "Título não pode ficar vazio.")
+        def save() -> None:
+            t_val = e_title.get().strip()
+            if not t_val:
                 return
-            notes_val = e_notes.get().strip()
-            prio_val = e_prio.get().strip().upper() or "P2"
-            if prio_val not in ("P1", "P2", "P3"):
-                prio_val = "P2"
 
-            if task and index is not None:
-                task.title = title_val
-                task.notes = notes_val
-                task.priority = prio_val
-                self.tasks[index] = task
+            if task:
+                # Editando existente
+                task.title = t_val
+                task.notes = e_notes.get().strip()
+                task.quadrant = q_var.get()
+                task.period = p_var.get()
             else:
-                self.tasks.append(TaskItem.create(title_val, notes_val, prio_val))
+                # Nova tarefa
+                self.tasks.append(
+                    TaskItem.create(
+                        title=t_val,
+                        notes=e_notes.get().strip(),
+                        quadrant=q_var.get(),
+                        period=p_var.get(),
+                    )
+                )
 
             self.store.save_today(self.tasks)
             self._refresh_task_list()
@@ -433,13 +602,13 @@ class DailyOpsUI:
 
         tk.Button(
             win,
-            text="SALVAR",
+            text="SALVAR ALTERAÇÕES",
             command=save,
             bg=THEME["pink"],
             fg=THEME["bg"],
             relief="flat",
             font=THEME["font_big"],
-        ).pack(pady=16)
+        ).pack(pady=30, fill="x", padx=20)
 
     # ---------------- Chat / Streaming ----------------
     def _send(self, text: str) -> None:
@@ -463,6 +632,8 @@ class DailyOpsUI:
             self.ui_queue.put(("chunk", chunk))
 
         def on_final(full: str):
+            # Salva histórico assim que o agente terminar de responder
+            self.chat_store.save(self.runner.history)
             self.ui_queue.put(("final", full))
 
         self.ui_queue.put(("begin", ""))
