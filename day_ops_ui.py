@@ -11,6 +11,7 @@ from gcal_sync import sync_ops_plan
 from day_ops_core import (
     DailyOpsRunner,
     DailyOpsConfig,
+    DatabaseManager,
     TaskStore,
     TaskItem,
     DistractionStore,
@@ -50,13 +51,20 @@ class DailyOpsUI:
         self.root.geometry("1200x720")
         self.root.configure(bg=THEME["bg"])
 
-        self.state = UIState(vault_dir=Path.home() / ".ops_agent")
-        self.store = TaskStore(self.state.vault_dir)
-        self.distraction_store = DistractionStore(self.state.vault_dir)
+        # 1. Localização fixa (Home do Usuário)
+        self.vault_path = Path.home() / ".ops_agent"
+        self.vault_path.mkdir(parents=True, exist_ok=True)
+        self.state = UIState(vault_dir=self.vault_path)
 
-        # --- Novo: persistência de chat ---
-        self.chat_store = ChatStore(self.state.vault_dir)
+        # 2. Inicialização na ordem correta
+        self.db_manager = DatabaseManager(self.vault_path)
+        self.store = TaskStore(self.db_manager)
+        self.distraction_store = DistractionStore(self.db_manager)
+        self.chat_store = ChatStore(self.db_manager)
+
+        # 3. Carregar tarefas e inicializar UI
         chat_history = self.chat_store.load()
+        self.tasks = self.store.load_today()
 
         # Runner recebe histórico para manter "memória" no dia
         self.runner = DailyOpsRunner(DailyOpsConfig(model="gpt-4o-mini"), history=chat_history)
@@ -64,8 +72,6 @@ class DailyOpsUI:
         self.ui_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._build_layout()
 
-        # Carrega estado inicial
-        self.tasks = self.store.load_today()
         self._refresh_task_list()
         self._load_chat_history_to_ui(chat_history)
 
@@ -84,7 +90,7 @@ class DailyOpsUI:
         title.pack(side="left")
 
         self.vault_label = tk.Label(
-            top, text=f"Vault: {self.state.vault_dir}", fg=THEME["muted"], bg=THEME["bg"], font=THEME["font"]
+            top, text=f"Vault: {self.vault_path}", fg=THEME["muted"], bg=THEME["bg"], font=THEME["font"]
         )
         self.vault_label.pack(side="left", padx=15)
 
@@ -118,31 +124,36 @@ class DailyOpsUI:
 
         # Left panel: tasks
         left = tk.Frame(main, bg=THEME["panel"], bd=1, highlightthickness=1, highlightbackground=THEME["pink"])
-        left.pack(side="left", fill="y", padx=(0, 10))
+        left.pack(side="left", fill="both", padx=(0, 10))
 
-        tk.Label(left, text="TASKS // TODAY", fg=THEME["pink"], bg=THEME["panel"], font=THEME["font_big"]).pack(
+        tk.Label(left, text="TASKS // SELEÇÃO ATIVA", fg=THEME["pink"], bg=THEME["panel"], font=THEME["font_big"]).pack(
             anchor="w", padx=10, pady=(10, 6)
         )
 
-        self.task_list = tk.Listbox(
-            left,
-            width=52,
-            height=28,
-            bg=THEME["panel2"],
-            fg=THEME["text"],
-            selectbackground=THEME["pink"],
-            selectforeground=THEME["bg"],
-            font=THEME["font"],
-            relief="flat",
-            highlightthickness=0,
+        # --- ÁREA DE LISTA ROLÁVEL COM CHECKBOXES ---
+        container = tk.Frame(left, bg=THEME["panel2"])
+        container.pack(fill="both", expand=True, padx=10, pady=8)
+
+        self.canvas = tk.Canvas(container, bg=THEME["panel2"], highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg=THEME["panel2"])
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
         )
-        self.task_list.pack(padx=10, pady=8)
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
 
         # --- QUICK ADD SECTION ---
         quick_add_frame = tk.Frame(left, bg=THEME["panel2"], pady=5)
         quick_add_frame.pack(fill="x", padx=10, pady=(0, 10))
 
-        # Input de texto
+        # 1. Título
         self.quick_entry = tk.Entry(
             quick_add_frame,
             bg=THEME["bg"],
@@ -152,11 +163,39 @@ class DailyOpsUI:
             relief="flat",
             highlightthickness=1,
             highlightbackground=THEME["panel"],
+            width=20,
         )
-        self.quick_entry.pack(side="left", fill="x", expand=True, padx=(5, 2))
+        self.quick_entry.pack(side="left", padx=(5, 2))
+        self.quick_entry.insert(0, "Título...")
+        self.quick_entry.bind(
+            "<FocusIn>",
+            lambda e: self.quick_entry.delete(0, "end") if self.quick_entry.get() == "Título..." else None,
+        )
         self.quick_entry.bind("<Return>", lambda e: self._quick_add())
 
-        # Seletor de Quadrante (Q1–Q4)
+        # 2. Notas (Nova)
+        self.quick_notes_entry = tk.Entry(
+            quick_add_frame,
+            bg=THEME["bg"],
+            fg=THEME["muted"],
+            insertbackground=THEME["neon"],
+            font=THEME["font"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=THEME["panel"],
+            width=15,
+        )
+        self.quick_notes_entry.pack(side="left", padx=2)
+        self.quick_notes_entry.insert(0, "Notas...")
+        self.quick_notes_entry.bind(
+            "<FocusIn>",
+            lambda e: self.quick_notes_entry.delete(0, "end")
+            if self.quick_notes_entry.get() == "Notas..."
+            else None,
+        )
+        self.quick_notes_entry.bind("<Return>", lambda e: self._quick_add())
+
+        # 3. Quadrante
         self.quick_quadrant_var = tk.StringVar(value="Q2")
         quad_opt = tk.OptionMenu(quick_add_frame, self.quick_quadrant_var, "Q1", "Q2", "Q3", "Q4")
         quad_opt.config(
@@ -171,9 +210,9 @@ class DailyOpsUI:
         quad_opt["menu"].config(bg=THEME["panel"], fg=THEME["text"])
         quad_opt.pack(side="left", padx=2)
 
-        # Seletor de Período (MANHÃ/TARDE/NOITE)
-        self.quick_period_var = tk.StringVar(value="MANHÃ")
-        period_opt = tk.OptionMenu(quick_add_frame, self.quick_period_var, "MANHÃ", "TARDE", "NOITE")
+        # 4. Período (Adicionando FLEXÍVEL)
+        self.quick_period_var = tk.StringVar(value="FLEXÍVEL")
+        period_opt = tk.OptionMenu(quick_add_frame, self.quick_period_var, "FLEXÍVEL", "MANHÃ", "TARDE", "NOITE")
         period_opt.config(
             bg=THEME["bg"],
             fg=THEME["neon"],
@@ -186,7 +225,22 @@ class DailyOpsUI:
         period_opt["menu"].config(bg=THEME["panel"], fg=THEME["text"])
         period_opt.pack(side="left", padx=2)
 
-        # Botão +
+        # 5. Recorrência (Nova - Checkbutton)
+        self.quick_recurring_var = tk.BooleanVar(value=False)
+        self.quick_recurring_cb = tk.Checkbutton(
+            quick_add_frame,
+            text="Rec",
+            variable=self.quick_recurring_var,
+            bg=THEME["panel2"],
+            fg=THEME["muted"],
+            selectcolor=THEME["bg"],
+            activebackground=THEME["panel2"],
+            font=("Consolas", 8),
+            relief="flat",
+        )
+        self.quick_recurring_cb.pack(side="left", padx=2)
+
+        # 6. Botão +
         tk.Button(
             quick_add_frame,
             text="+",
@@ -280,6 +334,13 @@ class DailyOpsUI:
             color = THEME["pink"] if who == "YOU" else THEME["neon"]
             self._append_chat(who, content, color)
 
+    def _reload_chat_ui(self, history) -> None:
+        """Limpa o chat e recarrega o histórico (ex.: ao trocar de vault)."""
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+        self._load_chat_history_to_ui(history)
+
     def _btn(self, parent, label, cmd):
         return tk.Button(
             parent,
@@ -316,96 +377,176 @@ class DailyOpsUI:
         folder = filedialog.askdirectory()
         if not folder:
             return
-        self.state.vault_dir = Path(folder)
-        self.store = TaskStore(self.state.vault_dir)
+        self.vault_path = Path(folder)
+        self.vault_path.mkdir(parents=True, exist_ok=True)
+        self.state.vault_dir = self.vault_path
+        self.db_manager = DatabaseManager(self.vault_path)
+        self.store = TaskStore(self.db_manager)
+        self.distraction_store = DistractionStore(self.db_manager)
+        self.chat_store = ChatStore(self.db_manager)
         self.tasks = self.store.load_today()
-        self.vault_label.config(text=f"Vault: {self.state.vault_dir}")
+        chat_history = self.chat_store.load()
+        self.runner.history = chat_history
+        self.vault_label.config(text=f"Vault: {self.vault_path}")
         self._refresh_task_list()
-        self._log("SYSTEM", f"Vault alterado para: {self.state.vault_dir}")
+        self._reload_chat_ui(chat_history)
+        self._log("SYSTEM", f"Vault alterado para: {self.vault_path}")
 
     # ---------------- Tasks ----------------
     def _refresh_task_list(self) -> None:
-        self.task_list.delete(0, "end")
+        # Limpa o frame
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
 
-        # Mapa de índice visual -> TaskItem real (por causa dos separadores)
-        self.list_index_map: dict[int, TaskItem] = {}
+        # Ordenar tarefas (Q1 primeiro, depois Q2, etc)
+        quad_map = {"Q1": 0, "Q2": 1, "Q3": 2, "Q4": 3}
+        sorted_tasks = sorted(
+            self.tasks, key=lambda x: (x.status == "DONE", quad_map.get(x.quadrant, 9), x.created_at)
+        )
 
-        def add_section(title: str, color: str, quadrants: list[str]) -> None:
-            header_index = self.task_list.size()
-            self.task_list.insert("end", f"── {title} ──")
-            self.task_list.itemconfig(header_index, foreground=color)
+        for task in sorted_tasks:
+            task_frame = tk.Frame(self.scrollable_frame, bg=THEME["panel2"], pady=2)
+            task_frame.pack(fill="x", expand=True, padx=5)
 
-            filtered = [t for t in self.tasks if getattr(t, "quadrant", "Q2") in quadrants]
-            for t in filtered:
-                icon = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
-                idx = self.task_list.size()
-                period_short = (getattr(t, "period", "MANHÃ") or "MANHÃ")[0].upper()
-                self.task_list.insert("end", f"  {icon} [{t.quadrant}] ({period_short}) {t.title}")
-                if t.status == "DONE":
-                    self.task_list.itemconfig(idx, foreground=THEME["muted"])
-                self.list_index_map[idx] = t
+            # --- TOGGLE CUSTOMIZADO (SUBSTITUI O CHECKBUTTON) ---
+            # Mostra [X] se ativo e [ ] se inativo
+            toggle_text = "[X]" if getattr(task, "active", True) else "[ ]"
+            toggle_color = THEME["neon"] if getattr(task, "active", True) else THEME["muted"]
 
-        # 1. O POUCO VITAL (Q1, Q2)
-        add_section("O POUCO VITAL (20%)", THEME["neon"], ["Q1", "Q2"])
+            btn_toggle = tk.Button(
+                task_frame,
+                text=toggle_text,
+                fg=toggle_color,
+                bg=THEME["panel2"],
+                font=("Consolas", 10, "bold"),
+                relief="flat",
+                activebackground=THEME["panel2"],
+                activeforeground=THEME["pink"],
+                width=3,
+                command=lambda t=task: self._toggle_active_custom(t),
+            )
+            btn_toggle.pack(side="left")
 
-        # Espaço em branco
-        self.task_list.insert("end", "")
+            # --- RESTO DA LINHA (DONE, TEXTO, DELETE) ---
+            # Botão Done
+            done_color = THEME["neon"] if task.status == "DONE" else THEME["muted"]
+            btn_done = tk.Button(
+                task_frame,
+                text="✔",
+                font=("Consolas", 8, "bold"),
+                bg=THEME["bg"],
+                fg=done_color,
+                relief="flat",
+                padx=5,
+                command=lambda t=task: self._mark_specific_done(t),
+            )
+            btn_done.pack(side="left", padx=2)
 
-        # 2. AS MUITAS TRIVIALIDADES (Q3, Q4)
-        add_section("AS MUITAS TRIVIALIDADES (80%)", THEME["muted"], ["Q3", "Q4"])
+            # Texto
+            icon_rec = " 🔄" if getattr(task, "is_recurring", False) else ""
+            color = THEME["muted"] if task.status == "DONE" else THEME["text"]
+            period_raw = getattr(task, "period", "FLEXÍVEL")
+            period_short = "FLX" if period_raw == "FLEXÍVEL" else period_raw[:3]
+            lbl_text = f"[{task.quadrant}] ({period_short}) {task.title}{icon_rec}"
+
+            lbl = tk.Label(
+                task_frame, text=lbl_text, fg=color, bg=THEME["panel2"], font=THEME["font"], anchor="w", cursor="hand2"
+            )
+            lbl.pack(side="left", fill="x", expand=True, padx=5)
+            lbl.bind("<Button-1>", lambda e, t=task: self._edit_specific_task(t))
+
+            # Botão Delete
+            btn_del = tk.Button(
+                task_frame,
+                text="✖",
+                font=("Consolas", 8),
+                bg=THEME["bg"],
+                fg=THEME["err"],
+                relief="flat",
+                padx=5,
+                command=lambda t=task: self._delete_specific_task(t),
+            )
+            btn_del.pack(side="right", padx=2)
+
+        # Atualiza scrollregion após adicionar widgets
+        self.scrollable_frame.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
         warning = check_identity_overload(self.tasks)
         if warning:
             self._log("SYSTEM", warning)
 
-    def _selected_task_index(self) -> TaskItem | None:
-        sel = self.task_list.curselection()
-        if not sel:
-            return None
-        return self.list_index_map.get(int(sel[0]))
+    def _edit_specific_task(self, task: TaskItem) -> None:
+        """Edita uma tarefa específica (chamado ao clicar no texto da tarefa)."""
+        idx = self.tasks.index(task)
+        self._task_editor(title="Editar tarefa", task=task, index=idx)
+
+    def _toggle_active_custom(self, task: TaskItem) -> None:
+        """Inverte o estado ativo da tarefa e atualiza a UI."""
+        task.active = not getattr(task, "active", True)
+        # Salva no banco
+        self.store.save_today(self.tasks)
+        # Log de debug
+        print(f"[*] Tarefa '{task.title}' -> Active: {task.active}")
+        # Recarrega a lista para mostrar [X] ou [ ]
+        self._refresh_task_list()
+
+    def _mark_specific_done(self, task: TaskItem) -> None:
+        """Alterna entre TODO e DONE direto na linha."""
+        task.status = "DONE" if task.status != "DONE" else "TODO"
+        self.store.save_today(self.tasks)
+        self._refresh_task_list()
+
+    def _delete_specific_task(self, task: TaskItem) -> None:
+        """Deleta a tarefa imediatamente após confirmação rápida."""
+        if messagebox.askyesno("Confirmar", f"Deletar tarefa: {task.title}?"):
+            self.tasks.remove(task)
+            self.store.save_today(self.tasks)
+            self._refresh_task_list()
 
     def _add_task(self) -> None:
         self._task_editor(title="Nova tarefa")
 
     def _edit_task(self) -> None:
-        task = self._selected_task_index()
-        if not task:
-            messagebox.showinfo("Ops", "Selecione uma tarefa para editar.")
-            return
-        idx = self.tasks.index(task)
-        self._task_editor(title="Editar tarefa", task=task, index=idx)
+        # Com checkboxes, não há seleção de lista. Mostra mensagem informativa.
+        messagebox.showinfo("Ops", "Clique no texto da tarefa para editá-la.")
 
     def _delete_task(self) -> None:
-        task = self._selected_task_index()
-        if not task:
-            return
-        self.tasks.remove(task)
-        self.store.save_today(self.tasks)
-        self._refresh_task_list()
+        # Com checkboxes, não há seleção de lista. Mostra mensagem informativa.
+        messagebox.showinfo("Ops", "Clique no texto da tarefa para editá-la e depois delete.")
 
     def _mark_done(self) -> None:
-        task = self._selected_task_index()
-        if not task:
-            return
-        task.status = "DONE"
-        self.store.save_today(self.tasks)
-        self._refresh_task_list()
+        # Com checkboxes, não há seleção de lista. Mostra mensagem informativa.
+        messagebox.showinfo("Ops", "Clique no texto da tarefa para editá-la e depois marque como DONE.")
 
-    def _quick_add(self) -> None:
-        """Adição rápida de tarefas sem abrir popups."""
+    def _quick_add(self, event=None) -> None:
+        """Adição rápida de tarefas capturando Notas e Recorrência."""
         title = self.quick_entry.get().strip()
-        if not title:
+        # Evita salvar se o título estiver vazio ou for o placeholder
+        if not title or title == "Título...":
             return
+
+        notes = self.quick_notes_entry.get().strip()
+        if notes == "Notas...":
+            notes = ""
 
         quad = self.quick_quadrant_var.get() if hasattr(self, "quick_quadrant_var") else "Q2"
-        period = self.quick_period_var.get() if hasattr(self, "quick_period_var") else "MANHÃ"
+        period = self.quick_period_var.get() if hasattr(self, "quick_period_var") else "FLEXÍVEL"
+        is_rec = self.quick_recurring_var.get() if hasattr(self, "quick_recurring_var") else False
 
-        new_task = TaskItem.create(title=title, quadrant=quad, period=period)
+        # Criar e Salvar
+        new_task = TaskItem.create(title=title, notes=notes, quadrant=quad, period=period, is_recurring=is_rec)
+
         self.tasks.append(new_task)
         self.store.save_today(self.tasks)
         self._refresh_task_list()
 
+        # Limpar campos para a próxima entrada
         self.quick_entry.delete(0, "end")
+        self.quick_entry.insert(0, "Título...")
+        self.quick_notes_entry.delete(0, "end")
+        self.quick_notes_entry.insert(0, "Notas...")
+        self.quick_recurring_var.set(False)
         self.quick_entry.focus_set()
 
     # --- Dominó Mental: captura de distrações ---
@@ -569,10 +710,23 @@ class DailyOpsUI:
             side="left", expand=True, fill="x"
         )
 
-        p_var = tk.StringVar(value=(task.period if task else "MANHÃ"))
-        tk.OptionMenu(row, p_var, "MANHÃ", "TARDE", "NOITE").pack(
+        p_var = tk.StringVar(value=(task.period if task else "FLEXÍVEL"))
+        tk.OptionMenu(row, p_var, "FLEXÍVEL", "MANHÃ", "TARDE", "NOITE").pack(
             side="left", expand=True, fill="x", padx=(10, 0)
         )
+
+        # Checkbox de Recorrente
+        r_var = tk.BooleanVar(value=(getattr(task, "is_recurring", False) if task else False))
+        tk.Checkbutton(
+            win,
+            text="Tarefa Recorrente (Não some ao completar)",
+            variable=r_var,
+            bg=THEME["panel"],
+            fg=THEME["neon"],
+            selectcolor=THEME["bg"],
+            activebackground=THEME["panel"],
+            font=THEME["font"],
+        ).pack(anchor="w", padx=20, pady=10)
 
         def save() -> None:
             t_val = e_title.get().strip()
@@ -585,6 +739,7 @@ class DailyOpsUI:
                 task.notes = e_notes.get().strip()
                 task.quadrant = q_var.get()
                 task.period = p_var.get()
+                task.is_recurring = r_var.get()
             else:
                 # Nova tarefa
                 self.tasks.append(
@@ -593,6 +748,7 @@ class DailyOpsUI:
                         notes=e_notes.get().strip(),
                         quadrant=q_var.get(),
                         period=p_var.get(),
+                        is_recurring=r_var.get(),
                     )
                 )
 

@@ -1,8 +1,9 @@
 import asyncio
-import json
+import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any
 
@@ -15,7 +16,7 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 # =========================================================
 @dataclass(frozen=True)
 class DailyOpsConfig:
-    model: str = "gpt-5-nano"
+    model: str = "gpt-4o-mini"  # Ajustado para um modelo existente
     max_tool_iterations: int = 2  # KISS: sem tool-use pesado aqui
     max_context_tasks: int = 40   # limite pra não virar dump gigante
 
@@ -29,12 +30,16 @@ class TaskItem:
     title: str
     notes: str = ""
     quadrant: str = "Q2"       # Q1, Q2, Q3, Q4
-    period: str = "MANHÃ"      # MANHÃ / TARDE / NOITE
+    period: str = "FLEXÍVEL"   # FLEXÍVEL / MANHÃ / TARDE / NOITE
     status: str = "TODO"       # TODO / DOING / DONE
+    active: bool = True        # Define se a tarefa entra no plano
+    is_recurring: bool = False  # Recorrente ou Única
     created_at: float = 0.0
 
     @staticmethod
-    def create(title: str, notes: str = "", quadrant: str = "Q2", period: str = "MANHÃ") -> "TaskItem":
+    def create(
+        title: str, notes: str = "", quadrant: str = "Q2", period: str = "FLEXÍVEL", is_recurring: bool = False
+    ) -> "TaskItem":
         return TaskItem(
             id=str(uuid.uuid4())[:8],
             title=title.strip(),
@@ -42,108 +47,232 @@ class TaskItem:
             quadrant=quadrant.strip().upper(),
             period=period.strip().upper(),
             status="TODO",
+            active=True,
+            is_recurring=is_recurring,
             created_at=time.time(),
         )
 
 
 # =========================================================
-# Persistência simples (JSON por dia)
+# Persistência com SQLite
 # =========================================================
-class TaskStore:
+class DatabaseManager:
     def __init__(self, vault_dir: Path) -> None:
-        self.vault_dir = vault_dir
-        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        # Garante que o caminho seja absoluto e o arquivo fixo
+        self.db_path = (vault_dir / "ops_agent_vault.db").absolute()
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[*] Iniciando Banco de Dados em: {self.db_path}")
+        self._init_db()
 
-    def _today_file(self) -> Path:
-        yyyy_mm_dd = time.strftime("%Y-%m-%d")
-        return self.vault_dir / f"tasks_{yyyy_mm_dd}.json"
+    def _get_connection(self) -> sqlite3.Connection:
+        # timeout ajuda se houver travamento de escrita
+        return sqlite3.connect(self.db_path, timeout=10)
+
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT,
+                    title TEXT,
+                    notes TEXT,
+                    quadrant TEXT,
+                    period TEXT,
+                    status TEXT,
+                    active INTEGER DEFAULT 1,
+                    is_recurring INTEGER DEFAULT 0,
+                    created_at REAL,
+                    day_date TEXT,
+                    PRIMARY KEY (id, day_date)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role TEXT,
+                    content TEXT,
+                    timestamp REAL,
+                    day_date TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS distractions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT,
+                    processed INTEGER DEFAULT 0,
+                    day_date TEXT
+                )
+            """)
+            conn.commit()
+
+
+class TaskStore:
+    def __init__(self, db_manager: DatabaseManager) -> None:
+        self.db = db_manager
+
+    def _today_str(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
 
     def load_today(self) -> List[TaskItem]:
-        fp = self._today_file()
-        if not fp.exists():
-            return []
-        data = json.loads(fp.read_text(encoding="utf-8"))
-        tasks: List[TaskItem] = []
-        for item in data.get("tasks", []):
-            # Backward-compat: converte tarefas antigas com 'priority' para 'quadrant'
-            quadrant = item.get("quadrant")
-            if quadrant is None:
-                prio = item.get("priority", "P2")
-                quadrant = {
-                    "P1": "Q1",  # Importante e urgente
-                    "P2": "Q2",  # Importante, não urgente
-                    "P3": "Q3",  # Não importante, urgente
-                }.get(prio, "Q4")
+        today = self._today_str()
+        tasks = self._fetch_tasks_by_date(today)
 
-            period = item.get("period", "MANHÃ")
+        # Se não há tarefas hoje, vamos processar a virada do dia
+        if not tasks:
+            print(f"[*] Dia {today} vazio. Buscando tarefas do dia anterior...")
+            tasks = self._rollover_tasks(today)
+            if tasks:
+                print(f"[*] Encontradas {len(tasks)} tarefas do dia anterior. Aplicando rollover...")
+                self.save_today(tasks)  # Persiste a cópia para hoje
+            else:
+                print(f"[*] Nenhuma tarefa encontrada para rollover.")
 
-            tasks.append(
-                TaskItem(
-                    id=item.get("id", str(uuid.uuid4())[:8]),
-                    title=item.get("title", "").strip(),
-                    notes=item.get("notes", "").strip(),
-                    quadrant=str(quadrant).upper(),
-                    period=str(period).upper(),
-                    status=item.get("status", "TODO"),
-                    created_at=item.get("created_at", time.time()),
-                )
-            )
         return tasks
 
+    def _fetch_tasks_by_date(self, date_str: str) -> List[TaskItem]:
+        tasks: List[TaskItem] = []
+        with self.db._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM tasks WHERE day_date = ?", (date_str,))
+            for row in cursor:
+                # CORREÇÃO: sqlite3.Row não tem .get(), usamos verificação de chaves
+                active_val = bool(row["active"]) if "active" in row.keys() else True
+                recurring_val = bool(row["is_recurring"]) if "is_recurring" in row.keys() else False
+                tasks.append(
+                    TaskItem(
+                        id=row["id"],
+                        title=row["title"],
+                        notes=row["notes"],
+                        quadrant=row["quadrant"],
+                        period=row["period"],
+                        status=row["status"],
+                        active=active_val,
+                        is_recurring=recurring_val,
+                        created_at=row["created_at"],
+                    )
+                )
+        return tasks
+
+    def _rollover_tasks(self, today_str: str) -> List[TaskItem]:
+        """Busca o último dia com tarefas e decide o que sobrevive."""
+        with self.db._get_connection() as conn:
+            # Pega a data mais recente antes de hoje
+            last_date_row = conn.execute(
+                "SELECT day_date FROM tasks WHERE day_date < ? ORDER BY day_date DESC LIMIT 1", (today_str,)
+            ).fetchone()
+
+            if not last_date_row:
+                return []
+
+            last_date = last_date_row[0]
+            last_tasks = self._fetch_tasks_by_date(last_date)
+
+            new_tasks: List[TaskItem] = []
+            for t in last_tasks:
+                # REGRA NINJA:
+                # 1. Se é recorrente: Sempre passa para o dia seguinte (resetando status)
+                # 2. Se é única mas NÃO foi feita: Passa para o dia seguinte (acumula)
+                # 3. Se é única e FOI feita: Morre no dia anterior (concluído!)
+
+                should_pass = t.is_recurring or (not t.is_recurring and t.status != "DONE")
+
+                if should_pass:
+                    # Resetamos status de tarefas recorrentes feitas
+                    status = "TODO" if t.is_recurring else t.status
+
+                    # Criamos uma nova instância para o novo dia
+                    new_tasks.append(
+                        TaskItem(
+                            id=str(uuid.uuid4())[:8],  # Novo ID para o novo dia
+                            title=t.title,
+                            notes=t.notes,
+                            quadrant=t.quadrant,
+                            period=t.period,
+                            status=status,
+                            active=t.active,
+                            is_recurring=t.is_recurring,
+                            created_at=time.time(),
+                        )
+                    )
+            return new_tasks
+
     def save_today(self, tasks: List[TaskItem]) -> None:
-        fp = self._today_file()
-        payload = {"tasks": [asdict(t) for t in tasks]}
-        fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        today = self._today_str()
+        with self.db._get_connection() as conn:
+            # Estratégia Segura: Limpa e Re-insere em uma única transação
+            conn.execute("DELETE FROM tasks WHERE day_date = ?", (today,))
+            for t in tasks:
+                conn.execute(
+                    """INSERT INTO tasks (id, title, notes, quadrant, period, status, active, is_recurring, created_at, day_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        t.id,
+                        t.title,
+                        t.notes,
+                        t.quadrant,
+                        t.period,
+                        t.status,
+                        1 if t.active else 0,
+                        1 if t.is_recurring else 0,
+                        t.created_at,
+                        today,
+                    ),
+                )
+            conn.commit()  # GARANTE A ESCRITA NO HD
+            print(f"[*] Salvas {len(tasks)} tarefas para o dia {today}")
 
 
 class DistractionStore:
     """Captura e processa 'Dominó Mental' (distrações ao longo do dia)."""
 
-    def __init__(self, vault_dir: Path) -> None:
-        self.fp = vault_dir / "distractions_to_process.json"
-
-    def load(self) -> List[str]:
-        if not self.fp.exists():
-            return []
-        try:
-            return json.loads(self.fp.read_text(encoding="utf-8")).get("distractions", [])
-        except json.JSONDecodeError:
-            return []
+    def __init__(self, db_manager: DatabaseManager) -> None:
+        self.db = db_manager
 
     def add(self, text: str) -> None:
-        items = self.load()
-        items.append(text)
-        self.fp.write_text(json.dumps({"distractions": items}, ensure_ascii=False), encoding="utf-8")
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.db._get_connection() as conn:
+            conn.execute("INSERT INTO distractions (content, day_date) VALUES (?, ?)", (text, today))
+            conn.commit()
+
+    def load(self) -> List[str]:
+        with self.db._get_connection() as conn:
+            cursor = conn.execute("SELECT content FROM distractions WHERE processed = 0")
+            return [row[0] for row in cursor.fetchall()]
 
     def clear(self) -> None:
-        if self.fp.exists():
-            self.fp.unlink()
+        with self.db._get_connection() as conn:
+            conn.execute("UPDATE distractions SET processed = 1")
+            conn.commit()
 
 
 class ChatStore:
     """Persistência do histórico de chat por dia."""
 
-    def __init__(self, vault_dir: Path) -> None:
-        self.vault_dir = vault_dir
-        self.vault_dir.mkdir(parents=True, exist_ok=True)
-
-    def _get_file(self) -> Path:
-        yyyy_mm_dd = time.strftime("%Y-%m-%d")
-        return self.vault_dir / f"chat_history_{yyyy_mm_dd}.json"
+    def __init__(self, db_manager: DatabaseManager) -> None:
+        self.db = db_manager
 
     def load(self) -> List[Dict[str, str]]:
-        fp = self._get_file()
-        if not fp.exists():
-            return []
-        try:
-            return json.loads(fp.read_text(encoding="utf-8")).get("messages", [])
-        except Exception:
-            return []
+        today = datetime.now().strftime("%Y-%m-%d")
+        messages: List[Dict[str, str]] = []
+        with self.db._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT role, content FROM chat_history WHERE day_date = ? ORDER BY timestamp ASC",
+                (today,),
+            )
+            for row in cursor:
+                messages.append({"role": row["role"], "content": row["content"]})
+        return messages
 
     def save(self, messages: List[Dict[str, str]]) -> None:
-        fp = self._get_file()
-        payload = {"messages": messages}
-        fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.db._get_connection() as conn:
+            conn.execute("DELETE FROM chat_history WHERE day_date = ?", (today,))
+            for msg in messages:
+                conn.execute(
+                    "INSERT INTO chat_history (role, content, timestamp, day_date) VALUES (?, ?, ?, ?)",
+                    (msg["role"], msg["content"], time.time(), today),
+                )
+            conn.commit()
 
 
 # =========================================================
@@ -152,6 +281,12 @@ class ChatStore:
 OPS_SYSTEM = r"""
 Você é o OPS_AGENT, um mestre em produtividade Ninja e Essencialismo.
 Sua missão é transformar a reatividade do usuário em protagonismo e "Transformação Vivida".
+
+CONSCIÊNCIA TEMPORAL:
+- Você receberá a hora atual e o período do dia (Manhã/Tarde/Noite).
+- Planeje apenas com base nas tarefas ATIVAS fornecidas no contexto.
+- Considere o tempo restante do dia ao criar cronogramas.
+- Para horas tardias (após 18h), sugira Ritual de Desligamento quando apropriado.
 
 ESTRUTURA DA RESPOSTA (OBRIGATÓRIA):
 
@@ -176,6 +311,7 @@ REGRAS DE FORMATO PARA O PLANO:
 DIRETRIZES TÉCNICAS:
 - Aplique a Regra dos 90%: Se uma tarefa não é claramente um "sim" (importância > 90), sugira descartar ou delegar.
 - Insira um [POWER UP] obrigatoriamente a cada 90-120 min de trabalho.
+- Tarefas marcadas como [FLEXÍVEL] não possuem horário fixo; encaixe-as nos [BUFFER] ou entre blocos de trabalho conforme a conveniência.
 - Use o tom de Seiiti Arata: direto, prático, focado em "Transformação Vivida > Teoria Entendida".
 
 EXEMPLO DE SAÍDA:
@@ -226,10 +362,18 @@ class DailyOpsRunner:
         self._lock = asyncio.Lock()
 
     def _build_context(self, tasks: List[TaskItem]) -> str:
-        # Limita número de tasks para não poluir contexto
+        agora = datetime.now()
+
+        # FILTRO CRÍTICO: Só envia para o agente o que está ATIVO (checkbox marcado)
+        tarefas_ativas = [t for t in tasks if getattr(t, "active", True)]
+
+        if not tarefas_ativas:
+            return "O usuário não selecionou nenhuma tarefa como 'ativa' para hoje ainda."
+
+        # Ordenação para o prompt
         quadrant_order = {"Q1": 0, "Q2": 1, "Q3": 2, "Q4": 3}
         tasks_sorted = sorted(
-            tasks,
+            tarefas_ativas,
             key=lambda t: (
                 t.status == "DONE",  # TODO/DOING primeiro
                 quadrant_order.get(getattr(t, "quadrant", "Q2"), 9),
@@ -238,14 +382,17 @@ class DailyOpsRunner:
         )[: self.config.max_context_tasks]
 
         lines: List[str] = []
-        for t in tasks_sorted:
-            prefix = "✅" if t.status == "DONE" else ("▶" if t.status == "DOING" else "•")
-            quadrant = getattr(t, "quadrant", "Q2")
-            period = getattr(t, "period", "MANHÃ")
-            lines.append(f"{prefix} [{quadrant}] ({period}) {t.title}")
+        lines.append(f"HORA ATUAL: {agora.strftime('%H:%M')}")
+        lines.append("TAREFAS ATIVAS PARA PLANEJAMENTO:")
 
-        if not lines:
-            return "Sem tarefas registradas hoje."
+        for t in tasks_sorted:
+            status = "✅" if t.status == "DONE" else "•"
+            quadrant = getattr(t, "quadrant", "Q2")
+            # Se for flexível, avisamos explicitamente ao agente
+            period_raw = getattr(t, "period", "FLEXÍVEL")
+            period = period_raw if period_raw != "FLEXÍVEL" else "QUALQUER MOMENTO (FLEXÍVEL)"
+            notes_part = f" (Notas: {t.notes})" if t.notes else ""
+            lines.append(f"  {status} [{quadrant}] ({period}) {t.title}{notes_part}")
 
         return "\n".join(lines)
 
@@ -263,10 +410,40 @@ class DailyOpsRunner:
         async with self._lock:
             tasks_ctx = self._build_context(tasks)
 
+            # Obtém a hora atual para consciência temporal
+            now = datetime.now()
+            current_time_str = now.strftime("%H:%M")
+            hour = now.hour
+
+            # Determina período do dia e tempo restante
+            if hour < 12:
+                period_context = "MANHÃ"
+                remaining_hours = 12 - hour
+            elif hour < 18:
+                period_context = "TARDE"
+                remaining_hours = 18 - hour
+            else:
+                period_context = "NOITE"
+                remaining_hours = 24 - hour
+
+            # Instruções baseadas no tempo
+            time_instructions = (
+                f"\n⏰ CONTEXTO TEMPORAL:\n"
+                f"- Hora atual: {current_time_str}\n"
+                f"- Período do dia: {period_context}\n"
+                f"- Horas restantes no período: aproximadamente {remaining_hours}h\n"
+                f"\nINSTRUÇÕES DE PLANEJAMENTO:\n"
+                f"- Planeje APENAS com base nas TAREFAS ATIVAS listadas acima.\n"
+                f"- Considere o tempo restante do dia ao criar o cronograma.\n"
+                f"- Se for tarde/noite ({hour >= 18}), sugira um Ritual de Desligamento se apropriado.\n"
+                f"- Priorize tarefas que cabem no tempo disponível.\n"
+                f"- Não inclua tarefas que não estão marcadas como 'ativas'.\n"
+            )
+
             prompt = (
-                "TAREFAS DO DIA (contexto):\n"
-                f"{tasks_ctx}\n\n"
-                "MENSAGEM DO USUÁRIO:\n"
+                f"{tasks_ctx}\n"
+                f"{time_instructions}\n"
+                f"MENSAGEM DO USUÁRIO:\n"
                 f"{user_message.strip()}\n"
             )
 
