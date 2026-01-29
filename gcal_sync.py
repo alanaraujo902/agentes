@@ -89,12 +89,10 @@ def sync_tasks_to_gcal(
     day: Optional[date] = None,
     calendar_id: str = "primary",
     tz_name: str = DEFAULT_TZ,
-    prune_missing: bool = False,
 ) -> dict:
     """
-    - Upsert por task.id usando extendedProperties.private:
-      ops_owner=ops_agent e ops_task_id=<id>
-    - Se prune_missing=True, remove do dia os eventos 'ops_agent' que não existirem mais na lista.
+    Sincroniza as tarefas limpando o que o agente já tinha postado no dia.
+    Estratégia "Clean Slate": deleta todos os eventos do OPS_AGENT do dia antes de inserir novos.
     """
     tz = ZoneInfo(tz_name)
     day = day or datetime.now(tz).date()
@@ -102,11 +100,30 @@ def sync_tasks_to_gcal(
 
     service = _get_service(vault_dir)
 
-    # IDs atuais para prune
-    current_ids = {getattr(t, "id") for t in tasks}
+    # --- 1. LIMPEZA (Nuke) ---
+    # Busca e deleta todos os eventos criados pelo 'ops_agent' neste dia específico
+    existing_ops_events = (
+        service.events()
+        .list(
+            calendarId=calendar_id,
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            singleEvents=True,
+            privateExtendedProperty="ops_owner=ops_agent",
+        )
+        .execute()
+    )
+    
+    cleaned = 0
+    for ev in existing_ops_events.get("items", []):
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=ev["id"]).execute()
+            cleaned += 1
+        except Exception:
+            pass  # Ignora se já foi deletado ou erro menor
 
+    # --- 2. INSERÇÃO (Fresh Start) ---
     created = 0
-    updated = 0
     skipped_no_time = 0
 
     for t in tasks:
@@ -123,86 +140,29 @@ def sync_tasks_to_gcal(
         start_dt = datetime.combine(day, _parse_hhmm(start_hhmm), tzinfo=tz)
         end_dt = datetime.combine(day, _parse_hhmm(end_hhmm), tzinfo=tz)
 
-        # Se alguém botar 23:50-00:10, isso cruza dia; aqui você pode decidir a regra.
         if end_dt <= start_dt:
-            # regra simples: empurra pro próximo dia
             end_dt = end_dt + timedelta(days=1)
 
         clean_title = _strip_time_prefix(title)
-        prio = getattr(t, "priority", "P2")
-        status = getattr(t, "status", "TODO")
-        notes = getattr(t, "notes", "")
-
+        
         event_body = {
             "summary": clean_title,
-            "description": (
-                f"OPS_AGENT task_id={getattr(t, 'id', '')}\n"
-                f"Prioridade: {prio}\n"
-                f"status={status}\n\n"
-                f"{notes}".strip()
-            ),
+            "description": f"Plano gerado pelo OPS_AGENT em {datetime.now().strftime('%H:%M')}",
             "start": {"dateTime": start_dt.isoformat(), "timeZone": tz_name},
             "end": {"dateTime": end_dt.isoformat(), "timeZone": tz_name},
             "extendedProperties": {
                 "private": {
-                    "ops_owner": "ops_agent",
-                    "ops_task_id": getattr(t, "id", ""),
+                    "ops_owner": "ops_agent",  # Marca registrada para podermos deletar depois
                 }
             },
+            # Cor diferenciada para o plano do agente (ex: cor 5 é amarela/banana)
+            "colorId": "5"
         }
 
-        # Busca evento do dia com esse task_id (privateExtendedProperty)
-        existing = (
-            service.events()
-            .list(
-                calendarId=calendar_id,
-                timeMin=day_start.isoformat(),
-                timeMax=day_end.isoformat(),
-                singleEvents=True,
-                privateExtendedProperty=f"ops_task_id={getattr(t, 'id', '')}",
-            )
-            .execute()
-        )
-        items = existing.get("items", [])
+        service.events().insert(calendarId=calendar_id, body=event_body).execute()
+        created += 1
 
-        if items:
-            event_id = items[0]["id"]
-            service.events().patch(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
-            updated += 1
-        else:
-            service.events().insert(calendarId=calendar_id, body=event_body).execute()
-            created += 1
-
-    deleted = 0
-    if prune_missing:
-        # lista todos eventos do dia que pertencem ao ops_agent e deleta os que não estão mais em tasks
-        all_ops = (
-            service.events()
-            .list(
-                calendarId=calendar_id,
-                timeMin=day_start.isoformat(),
-                timeMax=day_end.isoformat(),
-                singleEvents=True,
-                privateExtendedProperty="ops_owner=ops_agent",
-            )
-            .execute()
-            .get("items", [])
-        )
-        for ev in all_ops:
-            priv = (ev.get("extendedProperties") or {}).get("private") or {}
-            tid = priv.get("ops_task_id")
-            if tid and tid not in current_ids:
-                service.events().delete(calendarId=calendar_id, eventId=ev["id"]).execute()
-                deleted += 1
-
-    return {
-        "day": day.isoformat(),
-        "calendar_id": calendar_id,
-        "created": created,
-        "updated": updated,
-        "deleted": deleted,
-        "skipped_no_time": skipped_no_time,
-    }
+    return {"status": "success", "created": created, "cleaned": cleaned}
 def sync_ops_plan(raw_text: str, vault_dir):
     from ops_plan_parser import parse_ops_plan
 
@@ -210,21 +170,13 @@ def sync_ops_plan(raw_text: str, vault_dir):
     today = datetime.now(tz).date()
 
     tasks = parse_ops_plan(raw_text)
+    
+    # Criamos objetos simples para o sync
+    class PseudoTask:
+        def __init__(self, title):
+            self.title = title
 
-    pseudo_tasks = []
-
-    for i, t in enumerate(tasks):
-        class X:
-            pass
-
-        x = X()
-        x.id = f"ops_{today}_{i}"
-        x.title = f"{t.start}–{t.end} — {t.title}"
-        x.priority = t.priority
-        x.status = "TODO"
-        x.notes = ""
-
-        pseudo_tasks.append(x)
+    pseudo_tasks = [PseudoTask(f"{t.start}–{t.end} — {t.title}") for t in tasks]
 
     return sync_tasks_to_gcal(
         tasks=pseudo_tasks,

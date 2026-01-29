@@ -274,6 +274,13 @@ class ChatStore:
                 )
             conn.commit()
 
+    def clear(self) -> None:
+        """Apaga o histórico de chat do dia atual no banco."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.db._get_connection() as conn:
+            conn.execute("DELETE FROM chat_history WHERE day_date = ?", (today,))
+            conn.commit()
+
 
 # =========================================================
 # Diretriz do Agente (Produtividade + insights)
@@ -281,6 +288,13 @@ class ChatStore:
 OPS_SYSTEM = r"""
 Você é o OPS_AGENT, um mestre em produtividade Ninja e Essencialismo.
 Sua missão é transformar a reatividade do usuário em protagonismo e "Transformação Vivida".
+
+DIRETRIZES DE AJUSTE (CRÍTICO):
+- Se o usuário pedir para adicionar algo ou mudar o horário, NÃO ignore.
+- Mantenha a continuidade: Se já existe um plano na conversa, ajuste-o. Não crie um plano do zero que ignore pedidos anteriores.
+- Se o usuário der uma restrição (ex: "chegar em casa às 17h"), faça o cálculo reverso (back-planning) para garantir que o cronograma funcione.
+- PRIORIZE o que o usuário fala no chat sobre a lista genérica de tarefas. O chat é a "ordem de comando" atual.
+- Use back-planning quando necessário: se o usuário precisa estar em algum lugar em um horário específico, calcule para trás (ex: chegar às 17h, Uber 20min, alongamento 5min, corrida 35min = começar corrida às 16:00).
 
 CONSCIÊNCIA TEMPORAL:
 - Você receberá a hora atual e o período do dia (Manhã/Tarde/Noite).
@@ -432,19 +446,17 @@ class DailyOpsRunner:
                 f"- Hora atual: {current_time_str}\n"
                 f"- Período do dia: {period_context}\n"
                 f"- Horas restantes no período: aproximadamente {remaining_hours}h\n"
-                f"\nINSTRUÇÕES DE PLANEJAMENTO:\n"
-                f"- Planeje APENAS com base nas TAREFAS ATIVAS listadas acima.\n"
-                f"- Considere o tempo restante do dia ao criar o cronograma.\n"
-                f"- Se for tarde/noite ({hour >= 18}), sugira um Ritual de Desligamento se apropriado.\n"
-                f"- Priorize tarefas que cabem no tempo disponível.\n"
-                f"- Não inclua tarefas que não estão marcadas como 'ativas'.\n"
             )
 
+            # Criamos um prompt que diferencia "Estado do Banco" de "Vontade do Usuário"
             prompt = (
-                f"{tasks_ctx}\n"
+                f"[SISTEMA: HORA ATUAL {current_time_str}]\n"
+                f"[ESTADO ATUAL DAS TAREFAS NO BANCO]:\n{tasks_ctx}\n"
                 f"{time_instructions}\n"
-                f"MENSAGEM DO USUÁRIO:\n"
-                f"{user_message.strip()}\n"
+                f"\n[PEDIDO DO USUÁRIO]:\n{user_message.strip()}\n\n"
+                f"Instrução: Analise meu pedido acima. Se eu pedi uma mudança, adição ou restrição de horário, "
+                f"aplique-a ao plano anterior mantendo a lógica de horários. Se já existe um plano na conversa, "
+                f"ajuste-o em vez de criar um novo do zero. Use back-planning quando eu der um horário de chegada ou compromisso."
             )
 
             full = ""
@@ -462,6 +474,12 @@ class DailyOpsRunner:
 
             if on_final is not None:
                 on_final(full)
+
+    def clear_history(self) -> None:
+        """Limpa a memória de curto prazo do agente."""
+        self.history = []
+        # O AutoGen armazena estado no AgentChat, resetar o histórico 
+        # aqui garante que nas próximas chamadas o prompt seja 'limpo'.
 
     async def close(self) -> None:
         await self._model_client.close()

@@ -294,6 +294,9 @@ class DailyOpsUI:
         self._btn(quick, "Reduzir escopo", lambda: self._send("Estou sobrecarregado. Reduza para o mínimo viável."))\
             .pack(side="left", padx=6)
         self._btn(quick, "Desligamento", self._shut_down_ritual).pack(side="left", padx=6)
+        
+        # NOVO BOTÃO: Limpar Chat
+        self._btn(quick, "Limpar Chat", self._clear_chat_ui).pack(side="left", padx=6)
 
         bottom = tk.Frame(right, bg=THEME["panel"])
         bottom.pack(fill="x", padx=10, pady=(0, 10))
