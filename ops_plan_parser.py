@@ -2,12 +2,11 @@ import re
 from dataclasses import dataclass
 from typing import List
 
-# MELHORIA: Só encerra o plano se encontrar o "3)" isolado no início de uma linha
-PLAN_BLOCK = re.compile(r"2\)\s*Plano(.*?)(?=\n\s*3\)|$)", re.S | re.I)
+# Busca a ÚLTIMA ocorrência do bloco "2) Plano"
+PLAN_BLOCK_RE = re.compile(r"2\)\s*(?:Plano|Cronograma).*?\n(.*?)(?=\n\s*3\)|$)", re.S | re.I)
 
-# MELHORIA: Regex ultra-flexível para capturar a linha independente do tipo de traço
-# Captura: 1.Início, 2.Fim, 3.Categoria(opcional), 4.Resto
-LINE = re.compile(r"-\s*(\d{2}:\d{2})\s*[\-–—]\s*(\d{2}:\d{2})\s*[\-–—]?\s*(\[.*?\])?\s*(.*)")
+# Regex para capturar as linhas
+LINE_RE = re.compile(r"^\s*-\s*(\d{2}:\d{2})\s*[\-–—]\s*(\d{2}:\d{2})\s*[\-–—]?\s*(\[.*?\])?\s*(.*)", re.M)
 
 
 @dataclass
@@ -19,39 +18,32 @@ class PlanTask:
 
 
 def parse_ops_plan(text: str) -> List[PlanTask]:
-    m = PLAN_BLOCK.search(text)
-    if not m:
+    # Encontra todos os blocos de plano no texto
+    blocks = list(PLAN_BLOCK_RE.finditer(text))
+    if not blocks:
         return []
 
-    block = m.group(1)
+    # Pega apenas o ÚLTIMO bloco encontrado (o mais recente)
+    last_block = blocks[-1].group(1)
+    
     tasks: List[PlanTask] = []
-
-    for line in block.splitlines():
-        line = line.strip()
-        if not line.startswith("-"):
-            continue
-
-        lm = LINE.match(line)
-        if not lm:
-            continue
-
-        start, end, category, rest = lm.groups()
-
-        # Extrair Prioridade (P1, P2 ou P3) de dentro dos parênteses
+    matches = LINE_RE.findall(last_block)
+    
+    for start, end, category, rest in matches:
+        # 1. Extrair Prioridade
         prio = "P2"
         prio_match = re.search(r"\(.*?(P\d).*?\)", rest)
         if prio_match:
             prio = prio_match.group(1)
 
-        # Limpar o título: remove os parênteses do final (ex: tempo e prioridade)
+        # 2. LIMPAR TÍTULO (Remove os colchetes [CATEGORIA] e as notas no final)
+        # Primeiro remove as notas (HH min; PX)
         title_clean = re.sub(r"\(.*?\)\s*$", "", rest).strip()
-
-        # Remove traços soltos que sobram no título
+        # Remove traços iniciais
         title_clean = title_clean.lstrip("—–- ").strip()
-
-        # Deixa apenas o nome da tarefa, sem categoria
-        full_title = title_clean
-
-        tasks.append(PlanTask(start=start, end=end, title=full_title, priority=prio))
+        
+        # O título final não deve conter a categoria [TRABALHO FOCADO]
+        # pois ela já vem no parâmetro 'category' da regex LINE_RE
+        tasks.append(PlanTask(start=start, end=end, title=title_clean, priority=prio))
 
     return tasks
